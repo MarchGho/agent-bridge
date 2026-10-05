@@ -20,7 +20,6 @@ import ctypes
 import functools
 import inspect
 import json
-import msvcrt
 import os
 import re
 import shutil
@@ -29,7 +28,6 @@ import subprocess
 import sys
 import time
 import uuid
-from _ctypes import COMError
 from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
 
@@ -38,9 +36,20 @@ import psutil
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-with redirect_stdout(sys.stderr):  # comtypes prints while generating its wrappers; stdout belongs to MCP
-    import uiautomation as auto
-    from uiautomation.uiautomation import _AutomationClient
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    import msvcrt
+    from _ctypes import COMError
+
+    with redirect_stdout(sys.stderr):  # comtypes prints while generating its wrappers; stdout belongs to MCP
+        import uiautomation as auto
+        from uiautomation.uiautomation import _AutomationClient
+    BUTTON, EDIT, DOCUMENT, PANE, WINDOW = (auto.ControlType.ButtonControl, auto.ControlType.EditControl,
+                                            auto.ControlType.DocumentControl, auto.ControlType.PaneControl,
+                                            auto.ControlType.WindowControl)
+else:  # elsewhere the server still starts and lists its tools (MCP directories check it in Linux Docker)
+    COMError = OSError
+    BUTTON = EDIT = DOCUMENT = PANE = WINDOW = None
 
 HOME = Path.home()
 CODEX = HOME / ".codex"
@@ -52,9 +61,6 @@ DESKTOP = next(Path(os.environ.get("LOCALAPPDATA", "")).glob("Packages/Claude_*/
 JOBS = Path(os.environ.get("AGENT_BRIDGE_HOME") or HOME / ".agent-bridge") / "jobs"
 APPS = ("codex", "claude_code", "claude_cli")
 WINDOW_EXE = {"codex": "chatgpt.exe", "claude_code": "claude.exe"}
-BUTTON, EDIT, DOCUMENT, PANE, WINDOW = (auto.ControlType.ButtonControl, auto.ControlType.EditControl,
-                                        auto.ControlType.DocumentControl, auto.ControlType.PaneControl,
-                                        auto.ControlType.WindowControl)
 RENAME = ", rename session"  # a Claude chat pane's title button: "<title>, rename session"
 GOAL_BUTTONS = {"pause": ("Pause goal",), "resume": ("Resume goal", "Unpause goal", "Continue goal", "Start goal")}
 REPLY_CAP = 8000
@@ -313,6 +319,8 @@ def _goal(thread_id):
 @contextmanager
 def _gui():
     """One GUI action at a time across every agent_bridge process, with COM ready on this thread."""
+    if not WINDOWS:
+        raise RuntimeError("agent-bridge drives the Windows desktop apps; this action needs Windows")
     JOBS.mkdir(parents=True, exist_ok=True)
     with open(JOBS / "gui.lock", "a+") as f:
         end = time.time() + 180

@@ -28,7 +28,7 @@ are watching, with that chat's full context.
 | `list_projects(app)` | Projects (folders) for `codex`, `claude_code` or `claude_cli`, most recently active first. |
 | `list_chats(app, project)` | Chats in a project, newest first, with each Codex chat's goal status and each Claude chat's busy/idle state. |
 | `read_chat(app, chat, last)` | The last messages of a chat: what was asked and each turn's final answer. |
-| `send_message(app, text, chat?, project?)` | Types into an existing chat, or starts a new one in any folder. A busy Codex chat gets the message as a Steer. Returns a `job_id`. |
+| `send_message(app, text, chat?, project?, send_now?)` | Types into an existing chat, or starts a new one in any folder. A busy Codex chat gets the message as a Steer; a running `claude_cli` chat gets it in its live process (`send_now` presses the CLI's send-now key). Returns a `job_id`. |
 | `wait_reply(job_id)` | Waits for the answer to a send. |
 | `codex_goal(chat, action, objective?)` | Gets, pauses, resumes or edits a Codex chat's goal, and checks the change against Codex's goal store. |
 | `codex_generate_image(prompt, dest_dir)` | Has Codex make an image with its `image_gen` tool and copies the file to you. |
@@ -72,7 +72,8 @@ The calling agent runs `list_chats`, `read_chat` and then `send_message`. The an
 - **Listing and reading** opens each app's own local files read-only: Codex's SQLite state and rollouts, and Claude's session JSON and JSONL transcripts.
 - **Sending** goes through UI Automation. The bridge first switches the ChatGPT app to Codex mode, then opens the chat from the sidebar. It handles a split Claude window. A busy Codex chat shows Queue and then Steer, and the bridge clicks Steer. Afterwards it puts back the chats you were looking at.
 - **Replies.** Every send starts a detached watcher. The watcher waits for the turn to end in the transcript and stores the reply in `~/.agent-bridge/jobs/` (set `AGENT_BRIDGE_HOME` to move it). If the caller is a desktop chat, the watcher types the reply into it.
-- **`claude_cli`** runs `claude -p --resume` headless with the `permission_mode` you pass.
+- **`claude_cli`** runs `claude -p --resume` headless with the `permission_mode` you pass, in stream-json mode (`--input-format stream-json --output-format stream-json`). The watcher owns the process and keeps its stdin open.
+- **Mid-run messages (`claude_cli`).** A chat runs one process at a time. A send to a chat whose run is still going does not start a second process: it goes into the running one's stdin within about a second, and the run takes it in, usually in the same turn. The job shows `into` (the run's job id), and both jobs get the run's last result as their reply. With `send_now=true` the bridge also sends the CLI's send-now control, so the running turn makes way for the message at once instead of after the tool call under way. When a result has stood a few seconds with nothing new, the bridge closes stdin and the process exits; a later send resumes the chat as usual.
 
 ## Limits and safety
 

@@ -1,6 +1,6 @@
 [project]
 name = "agent-bridge-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that lets one AI coding agent drive another: Claude Code and Codex desktop chats talk to each other on Windows."
 readme = "README.md"
 license = "MIT"

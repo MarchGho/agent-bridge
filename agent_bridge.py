@@ -21,11 +21,14 @@ import functools
 import inspect
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from contextlib import closing, contextmanager, redirect_stdout
@@ -54,11 +57,16 @@ else:  # elsewhere the server still starts and lists its tools (MCP directories 
 HOME = Path.home()
 CODEX = HOME / ".codex"
 CLAUDE = HOME / ".claude"
-# A Store (MSIX) install keeps %APPDATA%\Claude in its package folder; only processes inside the package see the
-# redirected path, so a bridge started by Codex must use the real one.
-DESKTOP = next(Path(os.environ.get("LOCALAPPDATA", "")).glob("Packages/Claude_*/LocalCache/Roaming/Claude/claude-code-sessions"),
+# Current desktop apps keep their data in %LOCALAPPDATA%\Claude-Data\<id>. A Store (MSIX) install keeps
+# %APPDATA%\Claude in its package folder; only processes inside the package see the redirected path, so a bridge
+# started by Codex must use the real one.
+_LOCAL = Path(os.environ.get("LOCALAPPDATA", ""))
+DESKTOP = next(iter([*_LOCAL.glob("Claude-Data/*/claude-code-sessions"),
+                     *_LOCAL.glob("Packages/Claude_*/LocalCache/Roaming/Claude/claude-code-sessions")]),
                Path(os.environ.get("APPDATA", "")) / "Claude" / "claude-code-sessions")
 JOBS = Path(os.environ.get("AGENT_BRIDGE_HOME") or HOME / ".agent-bridge") / "jobs"
+LIVE = JOBS / "live"  # claude_cli chats: <chat>.lock held by the watcher whose process runs it, <chat>.inbox
+GRACE_S = 3  # a run's stdin closes once its last result stood this long with no new message
 APPS = ("codex", "claude_code", "claude_cli")
 WINDOW_EXE = {"codex": "chatgpt.exe", "claude_code": "claude.exe"}
 RENAME = ", rename session"  # a Claude chat pane's title button: "<title>, rename session"
@@ -130,18 +138,29 @@ def _claude_live():
 
 
 def _desktop_sessions():
-    live, out = _claude_live(), []
+    """One entry per session. DESKTOP holds a folder per <account>/<org>, and a session copied between accounts keeps
+    its sessionId in both, so it would be listed twice and even its id would match 2 chats. The copy that counts is
+    the one in the folder the app wrote last (the signed-in account, whose sidebar is on screen), else the newest;
+    that copy's isArchived decides."""
+    live, copies, best = _claude_live(), [], {}
     for f in DESKTOP.glob("*/*/local_*.json"):
         try:
-            o = json.loads(f.read_text("utf8"))
+            copies.append((f.parent, f.stat().st_mtime, json.loads(f.read_text("utf8"))))
         except (OSError, ValueError):
             continue
+    shown = max(copies, key=lambda c: c[1], default=(None,))[0]
+    for folder, _, o in copies:
+        rank = (folder == shown, o.get("lastActivityAt") or 0)
+        if o["sessionId"] not in best or rank > best[o["sessionId"]][0]:
+            best[o["sessionId"]] = rank, o
+    out = []
+    for (in_sidebar, _), o in best.values():
         if o.get("isArchived"):
             continue
         cli = o.get("cliSessionId")
         out.append({"id": o["sessionId"], "cli_id": cli, "title": o.get("title") or "", "cwd": _path(o.get("cwd")),
                     "created": (o.get("createdAt") or 0) / 1000, "updated": (o.get("lastActivityAt") or 0) / 1000,
-                    "status": live.get(cli, "closed")})
+                    "status": live.get(cli, "closed"), "shown": in_sidebar})
     return sorted(out, key=lambda s: -s["updated"])
 
 
@@ -183,9 +202,14 @@ def _cli_title(path):
 
 
 def _sessions(app):
+    """Every app's chats, newest first, each id once: a chat listed twice makes even its own id match 2 chats.
+    The first, newest copy stays."""
     if app not in APPS:
         raise ValueError(f"app must be one of {APPS}")
-    return {"codex": _codex_threads, "claude_code": _desktop_sessions, "claude_cli": _cli_sessions}[app]()
+    first = {}
+    for s in {"codex": _codex_threads, "claude_code": _desktop_sessions, "claude_cli": _cli_sessions}[app]():
+        first.setdefault(s["id"], s)
+    return list(first.values())
 
 
 def _in_project(app, s, p):
@@ -225,10 +249,15 @@ def _chat(app, chat, project=None):
             for s in sessions:
                 s["title"] = _cli_title(s["transcript"])
         hit = [s for s in sessions if s["title"].lower() == chat.strip().lower()]
-    if len(hit) != 1:
-        found = [(s["id"], s["title"]) for s in hit]
-        raise ValueError(f"{len(hit)} {app} chats match {chat!r}{' ' + str(found) if found else ''}; pass the chat id")
+    if not hit:
+        raise ValueError(f"no {app} chat matches {chat!r}; pass a chat id or exact title from list_chats")
+    # Forks and child sessions keep their parent's title: take the one in the app's sidebar, else the newest
+    # (sessions come newest first), and say which.
+    hit.sort(key=lambda s: not s.get("shown", True))
     s = hit[0]
+    if len(hit) > 1:
+        s["note"] = (f"{len(hit)} {app} chats are titled {chat!r}; took {s['id']} ({'in the sidebar, ' if s.get('shown') else ''}"
+                     f"updated {_iso(s['updated'])}). The others: {[x['id'] for x in hit[1:]]}; pass an id to pick one.")
     if app == "codex":
         s["project"] = next((p["name"] for p in _codex_projects() if _in_project(app, s, p)), "")
     else:
@@ -485,11 +514,14 @@ def _sidebar_button(app, win, title, project=""):
         match = lambda c: c.Name.endswith(" " + title) and not c.Name.startswith(("More options for", "New session in"))
     for _ in range(2):
         hits = [c for c in _all(win, ctype=BUTTON) if match(c)]
-        same_title = sum(1 for s in _sessions(app) if s["title"] == title)
-        if hits and same_title <= 1:  # a pinned chat shows twice; both rows open the same chat
+        # Only chats the sidebar lists count (claude_code: the signed-in account's); a pinned chat shows twice and
+        # both rows open it. Same-titled rows of different chats look alike: the bridge cannot click the right one.
+        twins = [s["id"] for s in _sessions(app) if s["title"] == title and s.get("shown", True)]
+        if hits and len(twins) <= 1:
             return hits[0]
         if hits:
-            raise RuntimeError(f"{same_title} {app} chats are titled {title!r}; rename one so the sidebar row is unique")
+            raise RuntimeError(f"{len(twins)} {app} chats in the sidebar are titled {title!r} ({twins}) and their rows look "
+                               "alike; rename the one you mean in the app, then send again. Nothing was sent.")
         folder = _find(win, name=project, ctype=BUTTON, timeout=0.5) if project else None
         ec = folder.GetPattern(auto.PatternId.ExpandCollapsePattern) if folder else None
         if not ec or ec.ExpandCollapseState != auto.ExpandCollapseState.Collapsed:
@@ -682,6 +714,11 @@ def _save(job):
     JOBS.mkdir(parents=True, exist_ok=True)
     tmp = JOBS / f"{job['id']}.json.tmp"
     tmp.write_text(json.dumps(job, indent=1), "utf8")
+    for _ in range(50):  # a reader (wait_reply) holding the file open blocks the replace on Windows for a moment
+        try:
+            return tmp.replace(JOBS / f"{job['id']}.json")
+        except PermissionError:
+            time.sleep(0.1)
     tmp.replace(JOBS / f"{job['id']}.json")
 
 
@@ -689,11 +726,17 @@ def _load(job_id):
     f = JOBS / f"{job_id}.json"
     if not f.exists():
         raise ValueError(f"no job {job_id}")
+    for _ in range(50):  # the file is being replaced by _save at this instant
+        try:
+            return json.loads(f.read_text("utf8"))
+        except PermissionError:
+            time.sleep(0.1)
     return json.loads(f.read_text("utf8"))
 
 
 def _public(job):
-    keys = ("id", "status", "app", "chat_id", "title", "reply", "error", "caller", "delivered_at", "deliver_error")
+    keys = ("id", "status", "app", "chat_id", "title", "into", "reply", "error", "note", "caller", "delivered_at",
+            "deliver_error")
     out = {k: job[k] for k in keys if job.get(k) is not None}
     for k in ("sent_at", "finished_at"):
         if job.get(k):
@@ -758,17 +801,135 @@ def _discover(job):
             job.update(chat_id=s["id"], title=s["title"], transcript=str(path) if path else None)
 
 
+def _hold(chat, wait=True):
+    """Lock `chat` for one claude process (its watcher holds the lock until the process exits): the lock file's
+    handle, or None when another process holds it and wait is False."""
+    LIVE.mkdir(parents=True, exist_ok=True)
+    f = open(LIVE / f"{chat}.lock", "a+")
+    while True:
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return f
+        except OSError:
+            if not wait:
+                f.close()
+                return None
+            time.sleep(0.5)
+
+
+def _release(f):
+    f.seek(0)
+    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    f.close()
+
+
+def _to_live(chat, job):
+    """Hand a send to the process running `chat`: job 'into' names that run, which reads the text from the job file
+    (the inbox holds job ids only, and a run forwards only jobs naming it). False when no process takes input (none
+    runs, or it is closing; then the normal resume waits for the chat's lock)."""
+    inbox = LIVE / f"{chat}.inbox"
+    if not inbox.exists():
+        return False
+    if lock := _hold(chat, wait=False):  # nothing runs the chat: an inbox left by a killed watcher
+        inbox.unlink(missing_ok=True)
+        _release(lock)
+        return False
+    try:
+        with open(inbox, "r+b") as f:  # never creates; while it is open the watcher cannot close the inbox
+            job["into"] = json.loads(f.readline())["job"]
+            _save(job)
+            f.seek(0, 2)
+            f.write((json.dumps({"job": job["id"]}) + "\n").encode("utf8"))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _say(p, text, send_now=False):
+    mid = str(uuid.uuid4())
+    p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": None,
+                              "uuid": mid}) + "\n")
+    p.stdin.flush()
+    if send_now:  # the terminal's send-now key: the running turn takes the message in now (interrupt_send_now_v1)
+        time.sleep(0.3)  # the request acts only on a message already at the CLI
+        p.stdin.write(json.dumps({"type": "control_request", "request_id": mid,
+                                  "request": {"subtype": "interrupt", "send_now": True, "message_uuid": mid}}) + "\n")
+        p.stdin.flush()
+
+
 def _run_cli(job):
-    cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "json", "--permission-mode", job["permission_mode"]]
+    """One headless `claude -p` run in stream-json mode, one process per chat (a resume waits for the chat's lock).
+    Messages sent to the chat meanwhile go into this process's stdin (their job ids land in job 'joined'); stdin
+    closes once a result has stood GRACE_S with nothing new, and the CLI exits after its last turn."""
+    cmd = [shutil.which("claude") or "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+           "--verbose", "--permission-mode", job["permission_mode"]]
     if job.get("chat_id"):
         cmd += ["--resume", job["chat_id"]]
     env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") or k == "CLAUDE_CODE_GIT_BASH_PATH"}
-    r = subprocess.run(cmd, input=job["text"], cwd=job["cwd"] or HOME, env=env, capture_output=True, text=True, encoding="utf8",
-                       timeout=WATCH_HOURS * 3600, creationflags=subprocess.CREATE_NO_WINDOW)
+    lock = _hold(job["chat_id"]) if job.get("chat_id") else None
+    box, pos, end, o, settled = None, 0, time.time() + WATCH_HOURS * 3600, None, None  # settled: last result, nothing after
+    err = tempfile.TemporaryFile()
     try:
-        o = json.loads(r.stdout)
-    except ValueError:
-        raise RuntimeError(f"claude exited {r.returncode}: {(r.stderr or r.stdout)[-1500:]}")
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, cwd=job["cwd"] or HOME,
+                             env=env, text=True, encoding="utf8", creationflags=subprocess.CREATE_NO_WINDOW)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [*map(lines.put, p.stdout), lines.put(None)], daemon=True).start()
+        _say(p, job["text"])
+        while True:
+            if time.time() > end:
+                p.kill()
+                raise RuntimeError(f"claude ran past {WATCH_HOURS} h")
+            if box:
+                with open(box, "rb") as f:
+                    f.seek(pos)
+                    new = f.read()
+                new = new[:new.rfind(b"\n") + 1]
+                pos += len(new)
+                for jid in (json.loads(x)["job"] for x in new.splitlines()):
+                    m = _load(jid)
+                    if m.get("into") == job["id"]:  # sent through _send to this run
+                        _say(p, m["text"], m.get("send_now"))
+                        _save(dict(m, forwarded_at=time.time()))
+                        job.setdefault("joined", []).append(jid)
+                        settled = None
+            try:
+                line = lines.get(timeout=0.5)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                break
+            ev = json.loads(line) if line.startswith("{") else {}
+            if ev.get("type") == "system" and ev.get("subtype") == "init" and not box:
+                lock = lock or _hold(ev["session_id"])  # a new chat: its id is known from here on
+                job.update(chat_id=ev["session_id"], pid=p.pid)  # and it can take mid-run sends
+                _save(job)
+                box = LIVE / f"{ev['session_id']}.inbox"
+                box.write_text(json.dumps({"job": job["id"]}) + "\n", "utf8")
+                pos = box.stat().st_size
+            elif ev.get("type") == "result":
+                o, settled = ev, time.time()
+            elif ev.get("type") == "assistant":  # a queued message started a turn of its own
+                settled = None
+            elif ev.get("type") == "control_response":
+                job["control"] = ev.get("response")
+            if settled and time.time() - settled >= GRACE_S and not p.stdin.closed:
+                if box and box.suffix == ".inbox":
+                    try:
+                        box = box.replace(box.with_suffix(".closed"))  # fails while a sender holds it open
+                    except PermissionError:
+                        pass
+                    continue  # its last lines are forwarded next round; with none, stdin closes then
+                p.stdin.close()
+        p.wait(timeout=60)
+    finally:
+        if box:
+            box.unlink(missing_ok=True)
+        if lock:
+            _release(lock)
+    if o is None:
+        err.seek(0)
+        raise RuntimeError(f"claude exited {p.returncode} without a result: {err.read().decode('utf8', 'replace')[-1500:]}")
     job["chat_id"] = o.get("session_id") or job.get("chat_id")
     if o.get("is_error"):
         raise RuntimeError(str(o.get("result"))[-1500:])
@@ -819,22 +980,35 @@ def _watch(job_id):
         job.update(status="error", error=repr(ex))
     job["finished_at"] = time.time()
     _save(job)
+    joined = [_load(j) for j in job.get("joined", [])]  # mid-run sends: answered by this run's last result
+    for j in joined:
+        j.update({k: job.get(k) for k in ("status", "reply", "error", "chat_id", "finished_at")})
+        _save(j)
     if job.get("caller") and job["status"] in ("done", "error"):
         _deliver(job)
+    for j in joined:
+        if j.get("caller") and j["status"] in ("done", "error") and j["caller"] != job.get("caller"):
+            _deliver(j)
 
 
-def _send(app, text, chat=None, project=None, notify_caller=True, permission_mode="auto"):
+def _send(app, text, chat=None, project=None, notify_caller=True, permission_mode="auto", send_now=False):
     if app not in APPS:
         raise ValueError(f"app must be one of {APPS}")
     if not text.strip():
         raise ValueError("text is empty")
+    if send_now and app != "claude_cli":
+        raise ValueError("send_now applies to claude_cli only")
     job = {"id": uuid.uuid4().hex[:12], "app": app, "text": text, "hint": _ws(text)[:50], "sent_at": time.time(),
            "status": "waiting", "caller": _caller(text) if notify_caller else None}
+    if app == "claude_cli" and chat and _to_live(chat, dict(job, chat_id=chat, send_now=send_now)):
+        return _load(job["id"])  # a running chat named by id: no transcript scan, so it lands within a second
     s = _chat(app, chat, project) if chat else None
     p = _project(app, project) if project and not s else None
-    job.update(chat_id=s and s["id"], title=s and s["title"], cwd=s["cwd"] if s else p and p["path"])
+    job.update(chat_id=s and s["id"], title=s and s["title"], cwd=s["cwd"] if s else p and p["path"], note=s and s.get("note"))
     if app == "claude_cli":
-        job["permission_mode"] = permission_mode
+        job.update(permission_mode=permission_mode, send_now=send_now)
+        if s and _to_live(s["id"], job):  # the chat's process is running: no second one, its stdin takes the text
+            return job
     else:
         path = _transcript(app, s) if s else None
         job.update(transcript=str(path) if path else None, offset=path.stat().st_size if path else 0)
@@ -901,6 +1075,8 @@ def read_chat(app: str, chat: str, last: int = 4, project: str | None = None) ->
             if text.strip():
                 msgs.append({"role": "user" if kind == "user" else "assistant", "text": text[:4000]})
     out = {"id": s["id"], "title": s["title"], "messages": msgs[-last:]}
+    if s.get("note"):
+        out["note"] = s["note"]
     if app == "codex":
         out["goal"] = _goal(s["id"])
     else:
@@ -910,17 +1086,21 @@ def read_chat(app: str, chat: str, last: int = 4, project: str | None = None) ->
 
 @_tool
 def send_message(app: str, text: str, chat: str | None = None, project: str | None = None,
-                 notify_caller: bool = True, permission_mode: str = "auto") -> dict:
+                 notify_caller: bool = True, permission_mode: str = "auto", send_now: bool = False) -> dict:
     """Send `text` into a chat and press Enter.
     chat: id or exact title of an existing chat. Or leave chat empty to start a new chat: in `project` (a project
     name from list_projects, or any folder path; Codex gets a project made for a new folder), or with no folder
     when project is empty too.
     codex / claude_code are driven through the desktop app; a split Claude window is fine (a chat already on screen
     is used in place, otherwise it opens in the focused pane). The view returns to the chats the user was on.
-    claude_cli runs `claude -p --resume` headless with permission_mode.
+    claude_cli runs `claude -p --resume` headless with permission_mode, in stream-json mode, one process per chat:
+    a send to a chat whose run is still going goes into that process's stdin (within a second; the job shows
+    'into': the run's job id) and the run takes it in, usually in the same turn; both jobs get the run's last
+    result as their reply. send_now (claude_cli): press the CLI's send-now key for it, so the running turn takes it
+    in now instead of after the tool call under way. A send to a chat whose process has ended resumes it as usual.
     Returns a job_id. When the answer is ready it is saved; if you are a desktop chat it is also typed into your
     chat (notify_caller). Otherwise call wait_reply(job_id)."""
-    job = _send(app, text, chat, project, notify_caller, permission_mode)
+    job = _send(app, text, chat, project, notify_caller, permission_mode, send_now)
     caller = job.get("caller")
     how = (f"the reply will be typed into your {caller['app']} chat" if caller and caller["app"] in WINDOW_EXE
            else "call wait_reply(job_id) for the reply")

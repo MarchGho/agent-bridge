@@ -17,7 +17,7 @@ another agent's chats. It covers **Codex** in the ChatGPT desktop app, the **Cla
 pressing the same buttons you would. No subprocess copy and no hidden session: the message lands in the chat you
 are watching, with that chat's full context.
 
-- Claude as PI, Codex as worker. Claude reads a long-running Codex chat, steers it mid-turn, and pauses, resumes or rewrites its goal.
+- Claude as PI, Codex as worker. Claude reads a long-running Codex chat and steers it mid-turn.
 - Replies come back on their own. When the caller is itself a desktop chat, the answer is typed into the caller's chat when it is ready.
 - It works in both directions. Register it in Codex and Codex can hand work to a Claude session.
 
@@ -30,8 +30,6 @@ are watching, with that chat's full context.
 | `read_chat(app, chat, last)` | The last messages of a chat: what was asked and each turn's final answer. |
 | `send_message(app, text, chat?, project?, send_now?)` | Types into an existing chat, or starts a new one in any folder. A busy Codex chat gets the message as a Steer; a running `claude_cli` chat gets it in its live process (`send_now` presses the CLI's send-now key). Returns a `job_id`. |
 | `wait_reply(job_id)` | Waits for the answer to a send. |
-| `codex_goal(chat, action, objective?)` | Gets, pauses, resumes or edits a Codex chat's goal, and checks the change against Codex's goal store. |
-| `codex_generate_image(prompt, dest_dir)` | Has Codex make an image with its `image_gen` tool and copies the file to you. |
 
 ## Install
 

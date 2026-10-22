@@ -1,7 +1,7 @@
 """agent_bridge: an MCP server that lets one agent drive another.
 
 Targets (the `app` argument):
-  codex        Codex in the ChatGPT desktop app (ChatGPT.exe): projects, threads, goals, image_gen.
+  codex        Codex in the ChatGPT desktop app (ChatGPT.exe): projects, threads and their goal status.
   claude_code  Claude desktop app, Code tab sessions, including a split window (one chat per pane).
   claude_cli   Claude Code CLI sessions, run headless with `claude -p --resume`.
 
@@ -70,7 +70,6 @@ GRACE_S = 3  # a run's stdin closes once its last result stood this long with no
 APPS = ("codex", "claude_code", "claude_cli")
 WINDOW_EXE = {"codex": "chatgpt.exe", "claude_code": "claude.exe"}
 RENAME = ", rename session"  # a Claude chat pane's title button: "<title>, rename session"
-GOAL_BUTTONS = {"pause": ("Pause goal",), "resume": ("Resume goal", "Unpause goal", "Continue goal", "Start goal")}
 REPLY_CAP = 8000
 WATCH_HOURS = 8
 
@@ -78,8 +77,7 @@ mcp = MCPServer("agent-bridge", instructions=(
     "Drive other agents on this PC. app = 'codex' (Codex in the ChatGPT app), 'claude_code' (Claude "
     "desktop Code tab) or 'claude_cli' (headless Claude CLI). Flow: list_projects -> list_chats -> "
     "send_message. send_message returns a job_id. If you are a desktop chat, the reply is typed into "
-    "your chat when it is ready; otherwise call wait_reply(job_id). Codex goals: codex_goal. Images: "
-    "codex_generate_image."))
+    "your chat when it is ready; otherwise call wait_reply(job_id)."))
 
 
 # ---------- storage (read-only) ----------
@@ -1116,76 +1114,6 @@ async def wait_reply(job_id: str, timeout_s: int = 600) -> dict:
         if job["status"] != "waiting" or time.time() >= end:
             return _public(job)
         await anyio.sleep(3)
-
-
-@_tool
-def codex_goal(chat: str, action: str = "get", objective: str | None = None, project: str | None = None) -> dict:
-    """Read or steer the goal of a Codex chat (id or exact title).
-    action: 'get' | 'pause' (the stop button) | 'resume' (the start button) | 'edit' (opens Edit goal, replaces the
-    objective with `objective`, presses Save). Changes are checked against Codex's goal store."""
-    s = _chat("codex", chat, project)
-    g = _goal(s["id"])
-    if action == "get" or g is None:
-        return {"chat": s["title"], "goal": g}
-    if action not in ("pause", "resume", "edit"):
-        raise ValueError("action must be get, pause, resume or edit")
-    if action == "edit" and not (objective or "").strip():
-        raise ValueError("edit needs objective")
-    with _gui():
-        win = _window("codex")
-        prev = _view("codex", win)
-        _open_chat("codex", win, s["title"], s["project"])
-        if action == "edit":
-            pane = _find(win, name="Edit goal", ctype=PANE, timeout=1)
-            if not pane:
-                _find(win, name="Edit goal", ctype=BUTTON).GetInvokePattern().Invoke()
-                pane = _find(win, name="Edit goal", ctype=PANE)
-            box = _find(pane, name="Goal", ctype=EDIT)
-            box.GetValuePattern().SetValue(objective)
-            time.sleep(0.4)
-            if _ws(objective)[:40] not in _ws(_value(box)):
-                raise RuntimeError("the goal editor did not take the new text")
-            _find(pane, name="Save", ctype=BUTTON).GetInvokePattern().Invoke()
-            ok = lambda: _ws((_goal(s["id"]) or {}).get("objective")) == _ws(objective)
-        else:
-            want = "paused" if action == "pause" else "active"
-            if g["status"] == want:
-                _restore("codex", win, prev)
-                return {"chat": s["title"], "goal": g, "note": f"already {want}"}
-            btn = _find(win, ctype=BUTTON, pred=lambda c: c.Name in GOAL_BUTTONS[action], timeout=4)
-            if not btn:
-                names = sorted({c.Name for c in _all(win, ctype=BUTTON) if "goal" in c.Name.lower()})
-                raise RuntimeError(f"no {action} button; goal buttons on screen: {names}")
-            btn.GetInvokePattern().Invoke()
-            ok = lambda: (_goal(s["id"]) or {}).get("status") == want
-        end = time.time() + 15
-        while not ok():
-            if time.time() > end:
-                raise RuntimeError(f"clicked {action} but Codex's goal store did not change")
-            time.sleep(0.5)
-        _restore("codex", win, prev)
-    return {"chat": s["title"], "goal": _goal(s["id"])}
-
-
-@_tool
-def codex_generate_image(prompt: str, dest_dir: str, project: str = "scratch", timeout_s: int = 900) -> dict:
-    """Ask Codex (new chat in `project`) to make an image with its image_gen tool, wait, and copy the
-    result(s) into dest_dir. Returns the copied file paths; open them with your image viewer/Read tool."""
-    dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    job = _send("codex", "Use the image_gen tool to create the image described below. Do not edit any files. "
-                "When it is saved, reply with only the file path.\n\n" + prompt, project=project, notify_caller=False)
-    end = t0 + timeout_s
-    while job["status"] == "waiting" and time.time() < end:
-        time.sleep(3)
-        job = _load(job["id"])
-    if not job.get("chat_id"):
-        raise RuntimeError(f"the Codex chat did not start (job {job['id']})")
-    folder = CODEX / "generated_images" / job["chat_id"]
-    made = sorted(f for f in folder.glob("*") if f.is_file() and f.stat().st_mtime >= t0 - 1) if folder.exists() else []
-    return {"images": [str(shutil.copy2(f, dest / f.name)) for f in made], "codex_chat": job["chat_id"],
-            "status": job["status"], "reply": job.get("reply")}
 
 
 def main():
